@@ -1,0 +1,365 @@
+#!/usr/bin/env node
+
+var express = require('express');
+var proxy = require('express-http-proxy');
+var https = require('https');
+var _ = require('lodash');
+var bodyParser = require('body-parser');
+var app = express();
+var magicmirror = "https://api.magicmirror.design";
+var segmentAPI = "https://api.segment.io";
+var configs = require('./configs');
+var multer = require('multer'); // v1.0.5
+var upload = multer(); // for parsing multipart/form-data
+var fs = require('fs');
+var request = require('request');
+var Airtable = require('airtable');
+var async = require('async');
+var pg = require('pg');
+
+pg.defaults.ssl = true;
+
+function randomString(len, charSet) {
+    charSet = charSet || 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+    var randomString = '';
+    for (var i = 0; i < len; i++) {
+        var randomPoz = Math.floor(Math.random() * charSet.length);
+        randomString += charSet.substring(randomPoz,randomPoz+1);
+    }
+    return randomString;
+}
+
+// Forward Everything (e.g. proxy("http://localhost", forwardPath))
+var forwardPath = {
+  "forwardPath": function(req, res) {
+      return require('url').parse(req.url).path;
+  }
+};
+
+// Segment forward path
+var segmentForwardPath = {
+  decorateRequest: function(proxyReq, originalReq) {
+    // Submit json format data to Segment
+    proxyReq.bodyContent = JSON.stringify(proxyReq.bodyContent);
+    return proxyReq;
+  },
+  "forwardPath": function(req, res) {
+    // Forward every path to segment v1 API
+    return "/v1" + require('url').parse(req.url).path;
+  }
+};
+
+// app.use(stormpathEx.init(app, { }));
+app.use(bodyParser.json()); // support json encoded bodies
+app.use(bodyParser.urlencoded({ extended: true })); // support encoded bodies
+
+app.use(function (req, res, next) {
+
+    // Website you wish to allow to connect
+    res.setHeader('Access-Control-Allow-Origin', configs.allowOrigin);
+
+    // Request methods you wish to allow
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, PUT, PATCH, DELETE');
+
+    // Request headers you wish to allow
+    res.setHeader('Access-Control-Allow-Headers', 'X-Requested-With,content-type,Authorization,X-Refresh-Token,X-Access-Token');
+
+    // Set to true if you need the website to include cookies in the requests sent
+    // to the API (e.g. in case you use sessions)
+    res.setHeader('Access-Control-Allow-Credentials', true);
+
+    // Pass to next layer of middleware
+    next();
+});
+
+app.all('/replay/:in', function(req, res, next) {
+
+    var route = req.params;
+    var fullRoute = route[0];
+
+    var airtableKey = configs.airtable.airtableKey;
+    var airtableBase = configs.airtable.airtableRouteBase;
+    var viewEnv = (process.env.MS_ENV=='production')?'Production':'Staging';
+    var allIns = [];
+
+    base = new Airtable({ apiKey: airtableKey }).base(airtableBase);
+
+    // 1. get routes from airtable
+    base('In').find(route['in'], function(error, record) {
+
+        if (error) {
+          res.status(400).send({'success': false, 'message': error});
+          return;
+        }
+
+        if (record) {
+
+         // var host = configs.gateway.getHost();
+          var host = "http://localhost:" + process.env.PORT;
+          var url = record.get("URL");
+          var headers = JSON.parse(record.get("Header"));
+          var body = JSON.parse(record.get("Body"));
+
+          delete headers['cookie'];
+          delete headers['cache-control'];
+          delete headers['if-none-match'];
+          delete headers['accept-language'];
+          delete headers['accept-encoding'];
+          delete headers['upgrade-insecure-requests'];
+          delete headers['accept'];
+          delete headers['host'];
+          delete headers['connection'];
+          delete headers['user-agent'];
+          delete headers['host']
+          delete headers['content-length'];
+
+          var options = {
+            url: host + "/r" + url,
+            method: record.get("Method"),
+            headers: headers
+            // auth: config.auth,
+          };
+
+          if ((headers['content-type'] || "json").includes("json")){
+            options.json = body
+          } else {
+            options.form = body
+          }
+
+          console.log("+++created request: ");
+          console.log(options);
+          console.log("++end of option");
+
+          request(options, function(error, response, body){
+            // console.log(error);
+            // console.log(body);
+            // callback(null, error, response, body, headers);
+            res.send(response);
+          });
+        } else {
+          res.status(404).send({"success": false, "message": "not found"});
+        }
+    });
+
+  });
+
+app.all(/\/r((\/[^\/]+)+)/, function(req, res, next){
+    var route = req.params;
+    var fullRoute = route[0];
+    var components = route[0].split('/');
+    var requestTime = new Date();
+    var sessionId = randomString(4)+'_'+requestTime.getTime().toString();
+
+    var airtableKey = configs.airtable.airtableKey;
+    // quick fix
+    // var airtableBase = configs.airtable.airtableRouteBase;
+    var airtableBase = configs.airtable.airtableRouteBackupBase;
+    var livemode = (process.env.MS_ENV=='production')?true:false;
+    var viewEnv = (process.env.MS_ENV=='production')?'Production':'Staging';
+    var allRoutes = [];
+    var finalContentType = 'application/json';
+
+    var forceContentType = req.query.forceContentType || req.body.forceContentType || '';
+    if(forceContentType != ''){
+        if(forceContentType == 'html'){
+            finalContentType = 'text/html';
+        }
+    }
+
+    var client = new pg.Client(process.env.DATABASE_URL);
+    // client.on('drain', client.end.bind(client));
+    client.connect(function (err) {
+        if (err) throw err;
+    });
+
+    base = new Airtable({ apiKey: airtableKey }).base(airtableBase);
+
+    // 1. get routes from airtable
+    base('Route').select({
+        view: viewEnv,
+    }).eachPage(function page(records, fetchNextPage) {
+        allRoutes = allRoutes.concat(records);
+
+        // To fetch the next page of records, call `fetchNextPage`.
+        // If there are more records, `page` will get called again.
+        // If there are no more records, `done` will get called.
+        fetchNextPage();
+
+    }, function done(error) {
+        if (error) {
+            res.status(400).send({'success': false, 'message': error});
+            return;
+        }
+
+        var targetPath = null;
+        var outBody = _.assign({}, req.body);
+        var outQuery = _.assign({livemode: (livemode?'True':'False')}, req.query);
+
+        // 2. check route exist
+        _.forEach(allRoutes, function(route) {
+            var from = route.get('From') + '$';
+            var rVariable = /\{[a-zA-Z]+\}/g;
+            var variables = from.match(rVariable);
+            var rMatch = new RegExp(from.replace(rVariable, '(.+)'));
+            var values = fullRoute.match(rMatch);
+
+            if(values){
+                var inRecordId = null;
+                var outRecordId = null;
+
+                values.shift();
+                targetPath = route.get('To');
+
+                if(variables && variables.length > 0){
+                    for(var i=0; i<variables.length; i++){
+                        targetPath = targetPath.replace(variables[i], values[i]);
+                    }
+                }
+
+                // if(!_.isEmpty(req.query)){
+                var querystring = Object.keys(outQuery).reduce(function(a,k){a.push(k+'='+encodeURIComponent(outQuery[k]));return a},[]).join('&');
+                targetPath = targetPath + '?' + querystring;
+                // }
+
+                console.log('-------- From request --------');
+                console.log(from);
+                console.log(targetPath);
+                console.log(req.method);
+                console.log(req.headers);
+                console.log(outQuery);
+                console.log(outBody);
+                console.log(req.files);
+                console.log('-------- From request end --------');
+
+                async.waterfall([
+                    // Quick fix
+                    // 3. Create log in pgsql
+                    function(callback){
+                        var query = client.query({
+                            text: 'INSERT INTO in_log(url, method, body, query, header, env) VALUES($1, $2, $3, $4, $5, $6) RETURNING id',
+                            values: [fullRoute, req.method, JSON.stringify(outBody), JSON.stringify(outQuery), JSON.stringify(req.headers), viewEnv]
+                            // values: ['/fullRoute', 'GET', JSON.stringify({"start": "node ./bin/www"}), JSON.stringify({"start": "node ./bin/www"}), JSON.stringify(req.headers)]
+                        }, function(err, result) {
+                            if(!err){
+                                inRecordId = result.rows[0].id;
+                            }else{
+                                console.log('inlog error:');
+                                console.log(err);
+                            }
+
+                            callback(null);
+                        });
+                    },
+
+                    // 4. route request to target
+                    function(callback){
+                        var headers = _.assign({}, req.headers);
+                        delete headers['cookie'];
+                        delete headers['cache-control'];
+                        delete headers['if-none-match'];
+                        delete headers['accept-language'];
+                        delete headers['accept-encoding'];
+                        delete headers['upgrade-insecure-requests'];
+                        delete headers['accept'];
+                        delete headers['host'];
+                        delete headers['connection'];
+                        delete headers['user-agent'];
+                        delete headers['host'];
+                        delete headers['content-length'];
+
+                        var options = {
+                            url: targetPath,
+                            method: req.method,
+                            headers: headers,
+                            // auth: config.auth,
+                        };
+
+                        // var bodyParams = _.assign({}, req.body);
+
+                        if ((headers['content-type'] || "json").includes("json")){
+                           options.json = outBody;//req.body;
+                        } else {
+                           options.form = outBody;//req.body;
+                        }
+
+
+                        console.log('+++++++++++ before request +++++++++++');
+                        console.log(options);
+                        console.log('+++++++++++ before request end +++++++++++');
+
+                        request(options, function(error, response, body){
+                            console.log(error);
+                            console.log(body);
+                            callback(null, error, response, body, headers);
+                        });
+                    },
+                    /*
+                    proxy(require('url').parse(targetPath).hostname, {
+                      "forwardPath": function(req, res) {
+                        return "/" + require('url').parse(targetPath).pathname
+                      }
+                    }),
+                    */
+
+                    // 5. create out log after request finish
+                    function(error, response, body, headers, callback){
+                        console.log('out log here:');
+                        var query = client.query({
+                            text: 'INSERT INTO out_log(url, header, content_type, response, status_code, in_id, env) VALUES($1, $2, $3, $4, $5, $6, $7) RETURNING id',
+                            values: [targetPath, JSON.stringify(headers), finalContentType, JSON.stringify(body), response.statusCode + '', inRecordId, viewEnv]
+                        }, function(err, result) {
+                            if(err){
+                                console.log('outlog error:');
+                                console.log(err);
+
+                                client.end();
+                            }else{
+                                client.query({
+                                    text: 'UPDATE in_log SET out_id = $1 WHERE id = $2',
+                                    values: [result.rows[0].id, inRecordId]
+                                }, function(err, result) {
+                                    if(err){
+                                        console.log('update inlog error:');
+                                        console.log(err);
+                                    }
+                                    client.end();
+                                });
+                            }
+                        });
+                        
+                        callback(null, body);
+                    }
+
+                ], function(error, results){
+                    // 6. return result
+                    if(error){
+                        res.send({'success': false, 'error': error});
+                    }else{
+                        res.set('Content-Type', finalContentType);
+                        res.send(results);
+                    }
+                });
+
+                return false;
+            }
+        });
+
+        // Path not exist
+        if(targetPath === null){
+            var query = client.query({
+                text: 'INSERT INTO in_log(url, method, body, query, header) VALUES($1, $2, $3, $4, $5)',
+                values: ['Path not found: '+fullRoute, req.method, JSON.stringify(outBody), JSON.stringify(outQuery), JSON.stringify(req.headers)]
+                // values: ['/fullRoute', 'GET', JSON.stringify({"start": "node ./bin/www"}), JSON.stringify({"start": "node ./bin/www"}), JSON.stringify(req.headers)]
+            }, function(err, result) {
+                if(err){
+                    console.log(err);
+                }
+                res.send({});
+            });
+        }
+
+    });
+
+});
+
+app.listen(process.env.PORT || 3000);
